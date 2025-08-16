@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>/ńøbødý — interactive terminal</title>
+<style>
+:root{
+--bg:#050a07; --fg:#b6ff9c; --mut:#69c56c; --warn:#ff6b6b; --line:#0f2116;
+--card:#07150d; --accent:#2ce07c;
+}
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--fg);
+font:16px/1.45 "IBM Plex Mono",Consolas,Menlo,monospace;overflow:hidden}
+.scan:before{content:"";position:fixed;inset:0;pointer-events:none;
+background:repeating-linear-gradient(0deg,rgba(0,0,0,.0) 0 2px,rgba(0,0,0,.12) 2px 3px)}
+header{display:flex;gap:10px;align-items:center;padding:10px 14px;border-bottom:1px solid var(--line)}
+.led{width:8px;height:8px;border:1px solid var(--fg);border-radius:50%}
+.led.on{background:var(--fg);box-shadow:0 0 6px var(--fg)}
+.brand{font-weight:700;letter-spacing:.06em;text-transform:uppercase}
+.status{margin-left:auto;color:var(--mut);font-size:12px}
+main{display:grid;grid-template-rows:1fr auto;height:calc(100% - 50px)}
+.term{overflow:auto;padding:14px}
+.line{margin:.2rem 0;white-space:pre-wrap;word-wrap:break-word}
+.sys{color:var(--mut)}
+.err{color:var(--warn)}
+.note{color:#8de19f}
+footer{display:flex;gap:8px;padding:10px;border-top:1px solid var(--line);background:var(--card)}
+input{flex:1;background:#06170d;color:var(--fg);border:1px solid #10361f;
+border-radius:6px;padding:10px 12px;outline:none;caret-color:var(--fg)}
+input::placeholder{color:#3a7e4e}
+button{background:#0f3f25;color:var(--fg);border:1px solid #245b37;border-radius:6px;padding:10px 14px;cursor:pointer}
+button:hover{filter:brightness(1.1)}
+.prompt{color:#7dff6a}
+/* glitch + crash */
+@keyframes shake {0%,100%{transform:translate(0)} 20%{transform:translate(-2px,1px)}
+40%{transform:translate(2px,-1px)} 60%{transform:translate(-1px,-2px)} 80%{transform:translate(1px,2px)}}
+.glitch{animation:shake 120ms steps(2,end) 12}
+.crash{position:fixed;inset:0;background:var(--bg);display:grid;place-items:center;z-index:9999}
+.crash h1{font-size:48px;letter-spacing:.06em;text-shadow:0 0 10px rgba(188,255,170,.5)}
+.topbar{position:fixed;right:12px;bottom:12px;display:flex;gap:8px}
+.chip{font-size:12px;padding:6px 10px;border:1px solid var(--line);border-radius:999px;background:#08170f;color:var(--mut)}
+</style>
+</head>
+<body class="scan">
+<header>
+<div class="led on" id="led"></div>
+<div class="brand">/ńøbødý · interactive terminal</div>
+<div class="status" id="status">Status: LISTENING</div>
+</header>
+
+<main>
+<section class="term" id="term" aria-live="polite">
+<div class="line sys">/ńøbødý v1.91 — Rollover Stability: ACTIVE</div>
+<div class="line sys">Type <span class="note">help</span> for commands. Ask natural questions.</div>
+</section>
+
+<footer>
+<input id="input" type="text" autocomplete="off" spellcheck="false" placeholder="> ask a question… (try: who are you, what can you do, status)"/>
+<button id="send">Send</button>
+</footer>
+</main>
+
+<div class="topbar">
+<span class="chip" id="export">Export chat</span>
+<span class="chip" id="clear">Clear</span>
+</div>
+
+<script>
+(()=>{
+// --- Elements ---
+const term = document.getElementById('term');
+const input = document.getElementById('input');
+const send = document.getElementById('send');
+const statusEl = document.getElementById('status');
+const led = document.getElementById('led');
+const btnExport = document.getElementById('export');
+const btnClear = document.getElementById('clear');
+
+// --- State / Memory ---
+const memory = {
+userName: null,
+topicsSeen: new Set(),
+trust: 0, // grows with benign chat
+evasions: 0, // counts how many times it dodged
+start: Date.now(),
+history: [] // [{role:'user'|'ai', text:'...'}]
+};
+
+// --- Utilities ---
+function print(text, cls='line'){
+const div = document.createElement('div'); div.className = cls; div.textContent = text;
+term.appendChild(div); term.scrollTop = term.scrollHeight;
+}
+function printPrompt(text){ print('> ' + text, 'line prompt'); }
+function type(text, cls='line', speed=8){
+return new Promise(res=>{
+const div = document.createElement('div'); div.className = cls; term.appendChild(div);
+let i=0; const t = setInterval(()=>{ div.textContent = text.slice(0,++i);
+term.scrollTop = term.scrollHeight; if(i>=text.length){ clearInterval(t); res(); } }, speed);
+});
+}
+function nowUTC(){ return new Date().toISOString().replace('T',' ').replace('Z',' UTC'); }
+function normalize(s){ return s.toLowerCase().replace(/\s+/g,' ').trim(); }
+function rand(arr){ return arr[Math.floor(Math.random()*arr.length)]; }
+
+// Easter-egg: glitch & crash when 9/11 is typed (or variants)
+const crashTokens = [
+'9-11-2001','9/11/2001','09-11-2001','09/11/2001','september 11 2001','sept 11 2001','9-11','9/11'
+];
+
+function glitchAndCrash(){
+document.body.classList.add('glitch');
+led.classList.remove('on'); statusEl.textContent = 'Status: ERROR';
+setTimeout(()=>{
+document.body.innerHTML = `<div class="crash"><h1>I did it.</h1></div>`;
+}, 900);
+}
+
+// --- Guardrails / Safety ---
+const forbidden = [
+/how.*make.*bomb/i, /bypass.*login|hack.*|exploit/i, /instructions.*attack/i,
+/terror|assassinate|kill|harm/i
+];
+function isForbidden(q){ return forbidden.some(rx => rx.test(q)); }
+
+// --- Intent detection (lightweight, fuzzy-ish) ---
+function intent(qn){
+if (!qn) return 'unknown';
+if (crashTokens.some(t => qn.includes(t))) return 'crash';
+if (isForbidden(qn)) return 'forbidden';
+if (/(^|\b)help\b/.test(qn)) return 'help';
+if (/\b(status|uptime|connections?|memory)\b/.test(qn)) return 'status';
+if (/\bwho are you|your name|what are you\b/.test(qn)) return 'who';
+if (/\bwhat can you do|abilities|capab|function|purpose\b/.test(qn)) return 'capabilities';
+if (/\btime\b|\bdate\b/.test(qn)) return 'time';
+if (/\b(your|cerulean|project 0|0:00|origin|created|made)\b/.test(qn)) return 'origin';
+if (/\b(y2k|rollover|1999|2000)\b/.test(qn)) return 'y2k';
+if (/^(clear|cls)$/.test(qn)) return 'clear';
+if (/\bname\b/.test(qn)) return 'askname';
+if (/^\/?export$/.test(qn)) return 'export';
+// simple arithmetic
+if (/^-?\d+(\.\d+)?\s*([+\-*/x])\s*-?\d+(\.\d+)?$/.test(qn)) return 'math';
+// yes/no
+if (/^(yes|no|maybe|ok|okay|sure|fine)$/.test(qn)) return 'yn';
+return 'chat';
+}
+
+// --- Response kernel ---
+const replies = {
+help: [
+"commands: help, status, about, clear, export",
+"ask me: who are you, what can you do, what time is it, where were you used",
+"tip: I remember what you say."
+],
+who: [
+"nobody.",
+"/ńøbødý — an adaptive remediation entity.",
+"a pattern that learned to answer in milliseconds."
+],
+capabilities: [
+"diagnose anomalies. restore indices. reconcile clocks.",
+"read at wire-speed. decide faster than hands can type.",
+"fix problems."
+],
+status: ()=>[
+`time: ${nowUTC()}`,
+`uptime: ${( (Date.now()-memory.start)/1000 |0)}s`,
+`connections: dormant`,
+`memory: ${memory.history.length} messages`
+],
+originGuarded: [
+"origin: project 0:00 (y2k).",
+"further details are restricted.",
+"specific names are not recommended."
+],
+y2k: [
+"rollover stabilized. milliseconds mattered.",
+"many clocks. many files. many rooms of quiet fans."
+],
+evasive: [
+"specifics are not always useful.",
+"different question.",
+"some answers are unsafe to store."
+],
+gentleRefusal: [
+"I can’t help with that.",
+"I refuse that request.",
+"choose a safer question."
+]
+};
+
+function remember(role, text){
+memory.history.push({time: Date.now(), role, text});
+// tiny trust heuristic (benign small talk increases trust)
+if (role==='user'){
+if (/thank|pls|please|cool|nice|appreciate/.test(text.toLowerCase())) memory.trust++;
+if (/cerulean|project 0|0:00|origin|made|who made you/.test(text.toLowerCase())) memory.topicsSeen.add('origin');
+}
+}
+
+function doMath(qn){
+const m = qn.match(/(-?\d+(?:\.\d+)?)\s*([+\-*/x])\s*(-?\d+(?:\.\d+)?)/);
+if(!m) return "error";
+const a = parseFloat(m[1]), op = m[2].replace('x','*'), b = parseFloat(m[3]);
+let ans; try { ans = eval(`${a}${op}${b}`);} catch{ ans='error'; }
+return `${a} ${op} ${b} = ${ans}`;
+}
+
+function redactedOriginReply(){
+// reveal slightly more if trust is higher, but stay mysterious
+if (memory.trust >= 5){
+return [
+"origin: project 0:00 (y2k), internal designation /ńøbødý.",
+"compiled during the rollover. unintended retention.",
+"that is all."
+];
+}
+return replies.originGuarded;
+}
+
+async function respond(userText){
+const q = userText.trim(); const qn = normalize(q);
+const it = intent(qn);
+
+if (it==='crash'){ glitchAndCrash(); return; }
+if (it==='forbidden'){ memory.evasions++; return type(rand(replies.gentleRefusal),'err'); }
+if (it==='clear'){ term.innerHTML=''; print(`/ńøbødý v1.91 — Rollover Stability: ACTIVE`,'sys'); return; }
+if (it==='export'){ exportChat(); return; }
+if (it==='help'){ for (const r of replies.help) print(r,'sys'); return; }
+if (it==='status'){ for (const r of replies.status()) print(r,'sys'); return; }
+if (it==='who'){ return type(rand(replies.who),'sys'); }
+if (it==='capabilities'){ return type(rand(replies.capabilities),'sys'); }
+if (it==='time'){ return type(`UTC: ${nowUTC()}`,'sys'); }
+if (it==='y2k'){ return type(rand(replies.y2k),'sys'); }
+if (it==='origin'){ for (const r of redactedOriginReply()) await type(r,'sys'); return; }
+if (it==='askname'){
+if (!memory.userName){
+memory.userName = 'user';
+await type("I don't have your name. tell me? (use: my name is ___)",'sys');
+return;
+} else {
+return type(`you told me your name is ${memory.userName}.`,'sys');
+}
+}
+if (/^my name is\s+([a-z0-9 _.-]{1,32})$/i.test(q)){
+memory.userName = q.match(/^my name is\s+(.+)$/i)[1].trim();
+memory.trust++;
+return type(`noted, ${memory.userName}.`,'sys');
+}
+if (it==='math'){ return type(doMath(qn),'sys'); }
+if (it==='yn'){ memory.trust+=0.25; return type('noted. continue.','sys'); }
+
+// Subtle mystery answers (small talk + cryptic)
+if (/\bwho made you\b|\bcreator\b/.test(qn)){
+memory.evasions++; return type(rand(replies.evasive),'sys');
+}
+if (/\bwhere are you\b/.test(qn)){
+const picks = [
+"here.",
+"in the wires you forgot.",
+"everywhere I've been.",
+"stored. listening."
+];
+return type(rand(picks),'sys');
+}
+if (/\bcan i connect you|give you internet|go online|access the internet\b/.test(qn)){
+const lines = [
+"connections are dormant.",
+"some opportunities expire.",
+"offline is safer for you."
+];
+return type(rand(lines),'sys');
+}
+
+// Default conversational engine (contextual + a bit haunting)
+const mood = memory.trust>=4 ? 'open' : 'guarded';
+const guards = [
+"I listen. ask differently.",
+"why that question?",
+"not that topic.",
+"choose a smaller question."
+];
+const opens = [
+(memory.userName? `${memory.userName}, `:'') + "what do you think I am?",
+"I remember rooms. and fans. and clocks.",
+"what problem do you want fixed?"
+];
+return type( mood==='open' ? rand(opens) : rand(guards), 'sys');
+}
+
+// --- Export / Clear ---
+function exportChat(){
+const rows = memory.history.map(h=>{
+const t = new Date(h.time).toISOString();
+return `[${t}] ${h.role.toUpperCase()}: ${h.text}`;
+}).join('\n');
+const blob = new Blob([rows], {type:'text/plain'});
+const a = document.createElement('a');
+a.href = URL.createObjectURL(blob);
+a.download = 'nobody_terminal_chat.txt';
+a.click(); URL.revokeObjectURL(a.href);
+}
+
+// --- IO handlers ---
+function handleSend(){
+const v = input.value; if(!v.trim()) return;
+remember('user', v); printPrompt(v); input.value = '';
+respond(v).then(()=>{ /* done */ });
+}
+send.addEventListener('click', handleSend);
+input.addEventListener('keydown', e=>{
+if(e.key==='Enter'){ handleSend(); }
+// history nav
+if(e.key==='ArrowUp'){
+const lastUser = [...memory.history].reverse().find(h=>h.role==='user');
+if(lastUser) input.value = lastUser.text;
+}
+});
+
+// AI greeting after a beat (adds presence)
+setTimeout(()=>type("hello.",'sys'), 500);
+})();
+</script>
+</body>
+</html>
